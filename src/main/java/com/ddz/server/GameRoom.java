@@ -9,6 +9,7 @@ import com.ddz.common.Player;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -16,6 +17,7 @@ public class GameRoom {
     private static final int NUM_PLAYERS = 3;
     private final Map<String, ClientHandler> players = new ConcurrentHashMap<>();
     private final List<String> playerIds = new ArrayList<>();
+    private final Map<String, ReentrantLock> playerLocks = new ConcurrentHashMap<>();
 
     private GameState gameState = GameState.WAITING;
     private final Set<String> readyPlayers = new CopyOnWriteArraySet<>();
@@ -48,6 +50,7 @@ public class GameRoom {
         Player player = clientHandler.getPlayer();
         player.setId(playerId);
         players.put(playerId, clientHandler);
+        playerLocks.put(playerId, new ReentrantLock());
         if (!playerIds.contains(playerId)) {
             playerIds.add(playerId);
         }
@@ -197,57 +200,68 @@ public class GameRoom {
         broadcastGameState();
     }
 
-    public synchronized void handlePlay(String playerId, List<Card> cards) {
-        if (gameState != GameState.PLAYING || !playerId.equals(playerIds.get(currentPlayerIndex))) {
-            players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "还没轮到你出牌！"));
-            return;
-        }
-        if (cards == null || cards.isEmpty()) {
-            players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "出牌不能为空！"));
-            return;
+    public void handlePlay(String playerId, List<Card> cards) {
+        ReentrantLock playerLock = playerLocks.get(playerId);
+        if (playerLock == null) return;
+
+        playerLock.lock();
+        try {
+            synchronized (this) {
+                if (gameState != GameState.PLAYING || !playerId.equals(playerIds.get(currentPlayerIndex))) {
+                    players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "还没轮到你出牌！"));
+                    return;
+                }
+                if (cards == null || cards.isEmpty()) {
+                    players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "出牌不能为空！"));
+                    return;
+                }
+
+                ClientHandler playerHandler = players.get(playerId);
+                if (!playerHasCards(playerHandler.getHand(), cards)) {
+                    players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "你没有这些牌！"));
+                    return;
+                }
+
+                CardLogic.Play currentPlay = CardLogic.getPlayType(cards);
+                boolean isNewTurn = (lastPlayerId == null || lastPlayerId.equals(playerId));
+                CardLogic.Play lastEffectivePlay = isNewTurn ? null : lastPlayType;
+
+                if (currentPlay.getType() == CardLogic.CardType.INVALID) {
+                    players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "出牌牌型不合法！"));
+                    return;
+                }
+
+                if (lastEffectivePlay != null && lastPlayedCards.size() != cards.size() && !currentPlay.isBombOrRocket()) {
+                    players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "出牌数量与上家不一致！"));
+                    return;
+                }
+
+                if (!CardLogic.canPlay(lastEffectivePlay, currentPlay)) {
+                    players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "你的牌没有上家的牌大！"));
+                    return;
+                }
+
+                if (currentPlay.isBombOrRocket()) {
+                    scoreMultiplier *= 2;
+                    broadcastAll(new Message(MessageType.PROMPT, "💣 炸弹出现！当前倍率 x" + scoreMultiplier));
+                }
+
+                playCounts.merge(playerId, 1, Integer::sum);
+
+                for (Card cardToRemove : cards) {
+                    playerHandler.getHand().remove(cardToRemove);
+                }
+
+                lastPlayedCards = cards;
+                lastPlayType = currentPlay;
+                lastPlayerId = playerId;
+                passCount = 0;
+            }
+        } finally {
+            playerLock.unlock();
         }
 
         ClientHandler playerHandler = players.get(playerId);
-        if (!playerHasCards(playerHandler.getHand(), cards)) {
-            players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "你没有这些牌！"));
-            return;
-        }
-
-        CardLogic.Play currentPlay = CardLogic.getPlayType(cards);
-        boolean isNewTurn = (lastPlayerId == null || lastPlayerId.equals(playerId));
-        CardLogic.Play lastEffectivePlay = isNewTurn ? null : lastPlayType;
-
-        if (currentPlay.getType() == CardLogic.CardType.INVALID) {
-            players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "出牌牌型不合法！"));
-            return;
-        }
-
-        if (lastEffectivePlay != null && lastPlayedCards.size() != cards.size() && !currentPlay.isBombOrRocket()) {
-            players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "出牌数量与上家不一致！"));
-            return;
-        }
-
-        if (!CardLogic.canPlay(lastEffectivePlay, currentPlay)) {
-            players.get(playerId).sendMessage(new Message(MessageType.PLAY_INVALID, "你的牌没有上家的牌大！"));
-            return;
-        }
-
-        if (currentPlay.isBombOrRocket()) {
-            scoreMultiplier *= 2;
-            broadcastAll(new Message(MessageType.PROMPT, "💣 炸弹出现！当前倍率 x" + scoreMultiplier));
-        }
-
-        playCounts.merge(playerId, 1, Integer::sum);
-
-        for (Card cardToRemove : cards) {
-            playerHandler.getHand().remove(cardToRemove);
-        }
-
-        lastPlayedCards = cards;
-        lastPlayType = currentPlay;
-        lastPlayerId = playerId;
-        passCount = 0;
-
         String playerName = playerHandler.getPlayer().getName();
         broadcastAll(new Message(MessageType.PROMPT, "玩家 " + playerName + " 出了: " + formatCardsForPrompt(cards)));
 
@@ -395,6 +409,7 @@ public class GameRoom {
 
     public void removePlayer(String playerId) {
         ClientHandler handler = players.remove(playerId);
+        playerLocks.remove(playerId);
         if (handler != null) {
             playerIds.remove(playerId);
             readyPlayers.remove(playerId);
